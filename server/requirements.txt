@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+feedparser
+openai
+pydantic
+sqlalchemy
+psycopg2-binary
+python-dotenv
+requests
+beautifulsoup4
+pytest
+dashscope
+duckduckgo-search
