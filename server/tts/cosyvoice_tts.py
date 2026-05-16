@@ -15,17 +15,19 @@ class CosyVoiceTTS:
         self.model = "cosyvoice-v1"
         self.voice = voice
 
-    def generate_audio(self, text: str, output_path: str) -> str:
+    def generate_audio(self, text: str, output_dir: str) -> list:
         """
-        使用 CosyVoice 生成音频，支持长文本分段合成
+        使用 CosyVoice 为每段文字生成独立音频文件。
+        每段单独保存为一个 MP3，返回 segment 元数据列表。
+        不再直接二进制拼接 MP3。
         """
+        import time as time_mod
         import dashscope
         dashscope.api_key = self.api_key
-        
+        os.makedirs(output_dir, exist_ok=True)
+
         # 将长文本按换行符拆分，每段不超过 500 字
         paragraphs = [p.strip() for p in text.split('\n') if p.strip()]
-        
-        combined_audio = b""
 
         # 预设多音色库
         VOICE_MAP = {
@@ -33,6 +35,8 @@ class CosyVoiceTTS:
             "老铁": "longlaotie", # 幽默东北男声（带劲！）
             "default": self.voice
         }
+
+        segments = []
 
         for i, p in enumerate(paragraphs):
             # 动态识别音色标签
@@ -46,7 +50,6 @@ class CosyVoiceTTS:
 
             # 通用逻辑：在中英文、中数字交界处自动补空格
             refined_p = ""
-            # ... (保持原有的字符隔离逻辑)
             for idx in range(len(p)):
                 char = p[idx]
                 refined_p += char
@@ -62,35 +65,47 @@ class CosyVoiceTTS:
             p = p.replace("。", "。，").replace("！", "！，").replace("？", "？，")
             if not p.endswith((".", "。", "！", "？")):
                 p += "。"
-            p += " ... " 
-            
+            p += " ... "
+
             print(f"正在合成第 {i+1}/{len(paragraphs)} 段 (音色: {current_voice})...")
-            
+
             success = False
+            audio_chunk = None
             for attempt in range(3):
                 try:
                     # 每一段都创建一个新的 synthesizer 对象
                     synthesizer = SpeechSynthesizer(model=self.model, voice=current_voice)
                     audio_chunk = synthesizer.call(refined_p)
                     if audio_chunk:
-                        combined_audio += audio_chunk
                         success = True
-                        break 
+                        break
                     else:
                         print(f"警告：第 {i+1} 段第 {attempt+1} 次合成未返回数据，2秒后重试...")
                 except Exception as e:
                     print(f"警告：第 {i+1} 段第 {attempt+1} 次合成失败: {e}，2秒后重试...")
-                
-                import time
-                time.sleep(2) # 强制等待，避免高频请求被封禁
-            
+
+                time_mod.sleep(2)  # 强制等待，避免高频请求被封禁
+
             if not success:
                 print(f"错误：第 {i+1} 段合成在重试 3 次后依然失败，跳过该段。")
+                continue
 
-        if combined_audio:
-            with open(output_path, 'wb') as f:
-                f.write(combined_audio)
-            return output_path
+            # 每段单独保存为独立文件
+            seg_filename = f"segment_{i:03d}.mp3"
+            seg_path = os.path.join(output_dir, seg_filename)
+            with open(seg_path, 'wb') as f:
+                f.write(audio_chunk)
+
+            segments.append({
+                "index": i,
+                "text": p,
+                "voice": current_voice,
+                "audio_path": seg_path,
+                "filename": seg_filename,
+            })
+
+        if segments:
+            return segments
         else:
             raise Exception("CosyVoice TTS 呼叫失败，未返回任何音频数据")
 
