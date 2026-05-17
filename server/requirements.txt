@@ -11,3 +11,6 @@ beautifulsoup4
 pytest
 dashscope
 duckduckgo-search
+pedalboard
+soundfile
+numpy

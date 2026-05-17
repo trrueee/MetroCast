@@ -15,10 +15,13 @@ from ai.script_writer import (
     Segment,
     validate_episode_script,
     ValidationResult,
+    CHARS_PER_SECOND,
+    TARGET_MIN_CHARS,
+    TARGET_MAX_CHARS,
 )
 from ai.script_reviewer import review_script, ReviewResult
-from tts.openai_tts import TTSService as OpenAITTS
-from tts.cosyvoice_tts import CosyVoiceTTS
+from ai.script_polisher import ScriptPolisher
+from tts.base import get_tts_backend
 from audio.assembler import (
     PodcastAudioSegment,
     PodcastEpisodeAudioJob,
@@ -85,11 +88,7 @@ class DailyPipeline:
             city=self.city,
         )
 
-        tts_engine = os.getenv("TTS_ENGINE", "openai").lower()
-        if tts_engine == "cosyvoice":
-            self.tts = CosyVoiceTTS(voice=os.getenv("COSYVOICE_VOICE", "longxiaochun"))
-        else:
-            self.tts = OpenAITTS(voice=os.getenv("OPENAI_VOICE", "alloy"))
+        self.tts = get_tts_backend()
 
     def run(self, mode: str = "news", topic: str = None) -> Optional[dict]:
         """
@@ -191,6 +190,42 @@ class DailyPipeline:
             return None
         logger.info("Content review PASSED (0 errors, %d warnings).", len(review.warnings))
 
+        # ── 2d. Script polish (second-pass conversational refinement) ────
+        polisher = ScriptPolisher()
+        script = polisher.polish_script(script)
+
+        # ── 2e. Dynamic pause adjustment ──────────────────────────────────
+        speech_sec = script.total_chars / CHARS_PER_SECOND
+        current_pause_sec = sum(seg.pauseAfterMs for seg in script.segments) / 1000.0
+        estimated_total = speech_sec + current_pause_sec
+
+        TARGET_MIN_SEC = 420   # 7 min
+        TARGET_MAX_SEC = 900   # 15 min
+        PAUSE_MIN_MS = 300
+        PAUSE_MAX_MS = 1500
+
+        if estimated_total < TARGET_MIN_SEC:
+            # Too short — stretch pauses
+            stretch_factor = min((TARGET_MIN_SEC - speech_sec) / max(current_pause_sec, 0.1), 2.0)
+            for seg in script.segments:
+                if seg.type != "ending":
+                    seg.pauseAfterMs = min(int(seg.pauseAfterMs * stretch_factor), PAUSE_MAX_MS)
+            logger.info("Stretched pauses by %.2fx (estimated %.0fs -> %.0fs)",
+                        stretch_factor, estimated_total,
+                        speech_sec + sum(s.pauseAfterMs for s in script.segments) / 1000.0)
+        elif estimated_total > TARGET_MAX_SEC:
+            # Too long — compress pauses
+            compress_factor = max((TARGET_MAX_SEC - speech_sec) / max(current_pause_sec, 0.1), 0.5)
+            for seg in script.segments:
+                if seg.type != "ending" and seg.pauseAfterMs > PAUSE_MIN_MS:
+                    seg.pauseAfterMs = max(int(seg.pauseAfterMs * compress_factor), PAUSE_MIN_MS)
+            logger.info("Compressed pauses by %.2fx (estimated %.0fs -> %.0fs)",
+                        compress_factor, estimated_total,
+                        speech_sec + sum(s.pauseAfterMs for s in script.segments) / 1000.0)
+        else:
+            logger.info("Pause timing optimal (estimated %.0fs in [%d-%d]s target)",
+                        estimated_total, TARGET_MIN_SEC, TARGET_MAX_SEC)
+
         # ── 3. TTS per segment ──────────────────────────────────────────
         logger.info("Synthesizing per-segment audio via TTS...")
         prefix = "knowledge" if mode == "deep_dive" else "episode"
@@ -252,10 +287,22 @@ class DailyPipeline:
         logger.info("Assembling audio segments via PodcastAudioAssembler...")
 
         output_dir = os.path.join("storage", f"assembled_{prefix}_{date_str}")
+        # Background music config (optional)
+        enable_music = os.getenv("PODCAST_MUSIC_ENABLED", "true").lower() == "true"
+        music_path = os.getenv("PODCAST_MUSIC_PATH", "")
+        music_volume_db = float(os.getenv("PODCAST_MUSIC_VOLUME_DB", "-18"))
+        music_duck_db = float(os.getenv("PODCAST_MUSIC_DUCK_DB", "8"))
+
         job = PodcastEpisodeAudioJob(
             job_id=f"{prefix}_{date_str}",
             segments=segments,
             output_dir=output_dir,
+            crossfade_ms=60,
+            enable_effects=True,
+            enable_music=enable_music,
+            music_path=music_path or None,
+            music_volume_db=music_volume_db,
+            music_duck_amount_db=music_duck_db,
         )
 
         assembler = PodcastAudioAssembler()
@@ -268,6 +315,14 @@ class DailyPipeline:
                 logger.error("Quality BLOCKING: %s", quality["blocking_issues"])
             if quality.get("warnings"):
                 logger.warning("Quality warnings: %s", quality["warnings"])
+
+            # Compare estimated vs actual duration
+            actual_dur = quality.get("duration_sec", 0)
+            est_dur = script.estimated_total_duration_sec
+            if actual_dur > 0 and est_dur > 0:
+                deviation = abs(actual_dur - est_dur) / max(est_dur, 1)
+                logger.info("Duration: estimated=%.0fs, actual=%.0fs, deviation=%.1f%%",
+                            est_dur, actual_dur, deviation * 100)
         except Exception as e:
             logger.error("Failed to assemble audio: %s", e)
             return None

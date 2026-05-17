@@ -27,6 +27,8 @@ from audio.assembler import (
     PodcastAudioSegment,
     PodcastEpisodeAudioJob,
     PodcastAudioAssembler,
+    estimate_duration_sec,
+    estimate_total_duration,
 )
 
 
@@ -143,6 +145,27 @@ class TestAssemblerIntegration(unittest.TestCase):
 class TestAssemblerUnit(unittest.TestCase):
     """Tests that don't require ffmpeg — validate data structures & method signatures."""
 
+    def test_estimate_duration_sec(self):
+        """Chinese text: ~4.5 chars/sec."""
+        text = "早上好，我是小站姐，欢迎来到小站早班车。今天这几分钟，我们一起看看地铁出行里最值得留意的几件事。"
+        est = estimate_duration_sec(text)
+        expected = len(text) / 4.5
+        self.assertAlmostEqual(est, expected, places=2)
+
+    def test_estimate_total_duration(self):
+        texts = ["一段文字内容" * 10, "另一段文字" * 15, "最后一段" * 8]
+        pauses = [1000, 800, 0]
+        total = estimate_total_duration(texts, pauses)
+        self.assertGreater(total, 0)
+        # speech + pause
+        speech = sum(len(t) / 4.5 for t in texts)
+        pause = sum(pauses) / 1000.0
+        self.assertAlmostEqual(total, speech + pause, places=2)
+
+    def test_estimate_empty(self):
+        self.assertEqual(estimate_duration_sec(""), 0.0)
+        self.assertEqual(estimate_total_duration([], []), 0.0)
+
     def test_dataclass_creation(self):
         seg = PodcastAudioSegment(
             segment_id="seg_001",
@@ -152,7 +175,6 @@ class TestAssemblerUnit(unittest.TestCase):
         self.assertEqual(seg.segment_id, "seg_001")
         self.assertEqual(seg.pause_after_ms, 800)
         self.assertIsNone(seg.wav_path)
-        self.assertIsNone(seg.silence_path)
 
     def test_job_creation(self):
         segs = [
