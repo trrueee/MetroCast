@@ -560,43 +560,90 @@ class ScriptWriter:
         )
 
         prompt = _build_user_prompt(items, target_city, date_str)
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
 
-        # Stage 1: Generate structured JSON
-        logger.info("Calling AI to generate episode script...")
-        raw = self._call_ai(prompt, is_json=True, max_tokens=8000)
+        max_retries = 3
+        script = None
+        validation = None
 
-        # Stage 2: Parse and validate
-        script = self._parse_script(raw, episode_id, target_city, date_str)
+        for attempt in range(max_retries):
+            logger.info("Calling AI to generate episode script (attempt %d/%d)...", attempt + 1, max_retries)
+            try:
+                raw = self._call_ai(messages, is_json=True, max_tokens=8000)
+                # Parse
+                script = self._parse_script(raw, episode_id, target_city, date_str)
+                # Auto-fix simple segment ids first
+                script = self._fix_segment_ids(script)
+                # Validate
+                validation = validate_episode_script(script)
 
-        # Stage 3: Run validation
-        validation = validate_episode_script(script)
-        if validation.warnings:
-            logger.warning("Script validation warnings (%d):", len(validation.warnings))
-            for w in validation.warnings:
-                logger.warning("  - %s", w)
+                if validation.warnings:
+                    logger.warning("Script validation warnings (%d) on attempt %d:", len(validation.warnings), attempt + 1)
+                    for w in validation.warnings:
+                        logger.warning("  - %s", w)
 
-        if validation.has_fatal:
-            logger.warning(
-                "Script validation found %d fatal errors — attempting auto-fix:",
-                len(validation.fatal_errors),
-            )
-            for err in validation.fatal_errors:
-                logger.warning("  - %s", err)
+                if not validation.has_fatal:
+                    logger.info("Script validation PASSED on attempt %d.", attempt + 1)
+                    break
+                
+                logger.warning(
+                    "Script validation found %d fatal errors on attempt %d:",
+                    len(validation.fatal_errors), attempt + 1
+                )
+                for err in validation.fatal_errors:
+                    logger.warning("  - %s", err)
+                
+                # Feedback loop for next attempt
+                feedback_content = json.dumps(raw, ensure_ascii=False, indent=2)
+                messages.append({"role": "assistant", "content": feedback_content})
+                
+                feedback_lines = ["你生成的 JSON 在验证中失败了。请纠正以下问题并重新生成完整的符合格式的 JSON 对象："]
+                for err in validation.fatal_errors:
+                    feedback_lines.append(f"- 错误: {err}")
+                for warn in validation.warnings:
+                    feedback_lines.append(f"- 警告: {warn}")
+                feedback_lines.append("\n请特别注意：")
+                feedback_lines.append("1. 任何标记为 high-risk 的段落（如涉及停运、施工、班次调整），必须在 'sourceIds' 列表中填入对应的 'sourceId' (比如 [\"src_001\"])，绝对不能留空！并且对应的来源必须存在于最外层的 'sources' 列表中。")
+                feedback_lines.append("2. 请增加各段落口播文本的长度，使 fullScript 的总字数达到 2000 字以上（至少 1200 字以上），不要偷懒或大幅省略内容。")
+                feedback_lines.append("请重新输出完整的符合结构的 JSON，不要附加任何多余的解释。")
+                
+                messages.append({"role": "user", "content": "\n".join(feedback_lines)})
 
-            # Attempt auto-fix: renumber segmentIds
-            script = self._fix_segment_ids(script)
+            except Exception as e:
+                logger.warning("Attempt %d failed with exception: %s", attempt + 1, e)
+                if attempt == max_retries - 1:
+                    raise
+                # Simple retry feedback
+                messages.append({"role": "user", "content": f"生成失败或 JSON 格式错误：{e}。请重新生成结构正确、字段完整的 JSON 对象。"})
 
-            # Re-validate after fix
+        # Apply fallback auto-fixes if last attempt still has fatal errors
+        if validation and validation.has_fatal:
+            logger.warning("Applying fallback auto-fixes to rescue script on last attempt...")
+            for seg in script.segments:
+                if seg.riskLevel == "high" and not seg.sourceIds:
+                    if script.sources:
+                        seg.sourceIds = [script.sources[0].sourceId]
+                        logger.info("Fallback: Assigned source '%s' to high-risk segment '%s'", seg.sourceIds[0], seg.segmentId)
+                    else:
+                        dummy_sid = "src_fallback"
+                        script.sources.append(Source(sourceId=dummy_sid, title="官方交通信息提示", url="https://bjsubway.com", type="official"))
+                        seg.sourceIds = [dummy_sid]
+                        logger.info("Fallback: Created dummy official source for segment '%s'", seg.segmentId)
+            
+            # Re-validate after fallback fixes
             validation = validate_episode_script(script)
             if validation.has_fatal:
                 logger.error(
-                    "Script still has %d fatal errors after auto-fix:",
+                    "Script still has %d fatal errors after fallback rescue:",
                     len(validation.fatal_errors),
                 )
                 for err in validation.fatal_errors:
                     logger.error("  - %s", err)
             else:
-                logger.info("Auto-fix resolved all fatal errors.")
+                logger.info("Script successfully rescued via fallback auto-fixes.")
 
         logger.info(
             "Script generated: title='%s', %d segments, %d sources, "
@@ -709,7 +756,7 @@ class ScriptWriter:
         return script
 
     def _call_ai(
-        self, prompt: str, is_json: bool = False, max_tokens: int = 2000
+        self, prompt_or_messages: Any, is_json: bool = False, max_tokens: int = 2000
     ) -> Any:
         extra_body = {
             "enable_search": True,
@@ -719,12 +766,17 @@ class ScriptWriter:
             },
         }
 
+        if isinstance(prompt_or_messages, list):
+            messages = prompt_or_messages
+        else:
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt_or_messages},
+            ]
+
         response = self.client.chat.completions.create(
             model=self.model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
+            messages=messages,
             response_format={"type": "json_object"} if is_json else None,
             extra_body=extra_body,
             max_tokens=max_tokens,

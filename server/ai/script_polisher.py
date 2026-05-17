@@ -8,6 +8,7 @@ naturalness without changing the structure or factual content.
 Inspired by Voicebox's ``rewrite_as_profile`` pattern.
 """
 import logging
+import os
 from typing import Optional
 
 from openai import OpenAI
